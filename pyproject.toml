@@ -1,0 +1,19 @@
+[project]
+name = "nonebot-plugin-sendcount"
+version = "1.0.0"
+description = "A NoneBot plugin that count sended messages"
+authors = [
+  { name="Kailing Wang", email="wangkailing151@gmail.com" }
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["nonebot2>=2.0.0", "nonebot-adapter-onebot>=2.2.3"]  # 根据实际依赖填
+keywords = ["nonebot", "bot", "plugin"]
+
+[project.urls]
+"Homepage" = "https://github.com/yourname/nonebot-plugin-yourplugin"
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"

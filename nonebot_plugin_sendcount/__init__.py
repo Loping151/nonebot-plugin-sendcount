@@ -1,0 +1,289 @@
+from datetime import datetime, timedelta
+from pathlib import Path
+from functools import wraps
+from typing import Dict
+from nonebot.plugin import PluginMetadata
+import types
+
+from nonebot import get_driver, on_command
+from nonebot.log import logger
+from nonebot.permission import SUPERUSER
+from nonebot.adapters.onebot.v11 import Bot as OB11Bot, Message, MessageSegment, GroupMessageEvent, MessageEvent
+from nonebot.params import CommandArg
+from nonebot import require
+
+require("nonebot_plugin_sendcount")
+
+__plugin_meta__ = PluginMetadata(
+    name="nonebot_plugin_sendcount",
+    description="统计群聊和私聊的消息数量，支持每天自动记录、查看、恢复日志",
+    usage="""
+指令：
+- 统计 / sc：查看今日消息统计
+- 昨日统计 / scy：查看昨日消息统计
+- 群组统计 / gsc：查看今日各群发送数量（支持加参数查看特定群）
+- 昨日群组统计 / gscy：查看昨日各群发送数量（支持加参数查看特定群）
+
+功能：
+- 自动拦截 send_xxx_msg 统计消息数
+- 记录发送日志和详细内容
+- 每日自动归档到 data/msg_stats/YYYY-MM-DD 下
+""",
+    type="application",
+    homepage="https://github.com/loping151/nonebot-plugin-sendcount",
+    supported_adapters={"~onebot.v11"},
+)
+
+
+# === 配置 ===
+BASE_LOG_DIR = Path("data/msg_stats")
+BASE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_today_dir() -> Path:
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    dir_path = BASE_LOG_DIR / date_str
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
+
+def get_yesterday_dir() -> Path:
+    date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    dir_path = BASE_LOG_DIR / date_str
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
+
+
+def append_text(path: Path, text: str, encoding: str = "utf-8"):
+    with path.open("a", encoding=encoding) as f:
+        f.write(text)
+
+
+class StatsManager:
+    def __init__(self):
+        self.current_date: str = datetime.now().strftime("%Y-%m-%d")
+        self.stats: Dict[str, int] = {"group": 0, "private": 0, "unknown": 0}
+        self.group_stats: Dict[int, int] = {}  # 每群统计
+        self._load_log()
+
+    def update_date(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self.current_date:
+            self.current_date = today
+            self.stats = {"group": 0, "private": 0, "unknown": 0}
+            self.group_stats = {}
+            self._load_log()
+
+    def increment(self, category: str, group_id: int = None):
+        self.update_date()
+        self.stats[category] = self.stats.get(category, 0) + 1
+
+        if category == "group" and group_id is not None:
+            self.group_stats[group_id] = self.group_stats.get(group_id, 0) + 1
+            self._write_group_csv()
+
+        self._write_log()
+
+    def log_message_detail(self, category: str, target_id: int, content, content_type: str):
+        self.update_date()
+        log_file = get_today_dir() / f"{category}.log"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        content_str = self._format_content(content)
+        append_text(log_file, f"{timestamp} | {target_id} | {content_str}\n")
+
+    def _format_content(self, message) -> str:
+        if isinstance(message, Message):
+            parts = []
+            for seg in message:
+                if seg.type == "text":
+                    parts.append(seg.data.get("text", ""))
+                else:
+                    parts.append(f"[{seg.type}]")
+            return "".join(parts)
+        elif isinstance(message, MessageSegment):
+            if message.type == "text":
+                return message.data.get("text", "")
+            else:
+                return f"[{message.type}]"
+        elif isinstance(message, str):
+            return message
+        return "[unknown]" + str(message)[:50]
+
+    def _write_log(self):
+        file_path = get_today_dir() / "stats.log"
+        content = (
+            f"日期: {self.current_date}\n"
+            f"群聊发送数: {self.stats['group']}\n"
+            f"私聊发送数: {self.stats['private']}\n"
+            f"未知类型: {self.stats['unknown']}"
+        )
+        file_path.write_text(content, encoding="utf-8")
+
+    def _write_group_csv(self):
+        file_path = get_today_dir() / "group_stats.csv"
+        lines = ["id,count"]
+        for gid, count in self.group_stats.items():
+            lines.append(f"{gid},{count}")
+        file_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _load_log(self):
+        # 恢复 stats.log
+        file_path = get_today_dir() / "stats.log"
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8")
+            try:
+                for line in content.strip().splitlines():
+                    if "群聊发送数" in line:
+                        self.stats["group"] = int(line.split(":")[1].strip())
+                    elif "私聊发送数" in line:
+                        self.stats["private"] = int(line.split(":")[1].strip())
+                    elif "未知类型" in line:
+                        self.stats["unknown"] = int(line.split(":")[1].strip())
+                logger.info(f"[msg_counter] 从日志恢复统计数据: {self.stats}")
+            except Exception as e:
+                logger.warning(f"[msg_counter] 恢复 stats.log 失败: {e}")
+
+        # 恢复 group_stats.csv
+        csv_path = get_today_dir() / "group_stats.csv"
+        if csv_path.exists():
+            try:
+                lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+                self.group_stats = {}
+                for line in lines[1:]:
+                    gid_str, count_str = line.strip().split(",")
+                    self.group_stats[int(gid_str)] = int(count_str)
+                logger.info(f"[msg_counter] 从 CSV 恢复群组统计数据: {self.group_stats}")
+            except Exception as e:
+                logger.warning(f"[msg_counter] 恢复 group_stats.csv 失败: {e}")
+
+
+stats_manager = StatsManager()
+
+# === Hook call_api ===
+driver = get_driver()
+
+
+def patch_call_api(bot: OB11Bot):
+    original_call_api = bot.call_api
+
+    @wraps(original_call_api)
+    async def wrapped_call_api(self: OB11Bot, api: str, **data):
+        logger.debug(f"[msg_counter] 拦截 API 调用: {api}, 参数: {str(data)[:100]}")
+
+        message = data.get("message")
+        if api in {"send_group_msg", "send_group_msg_async"}:
+            gid = data.get("group_id", -1)
+            stats_manager.increment("group", gid)
+            stats_manager.log_message_detail("group", gid, message, data.get("message_type", "text"))
+
+        elif api in {"send_private_msg", "send_private_msg_async"}:
+            uid = data.get("user_id", -1)
+            stats_manager.increment("private", uid)
+            stats_manager.log_message_detail("private", uid, message, data.get("message_type", "text"))
+
+        elif api in {"send_msg", "send_msg_async"}:
+            msg_type = data.get("message_type", "unknown")
+            target_id = data.get("group_id") if msg_type == "group" else data.get("user_id", -1)
+            stats_manager.increment(msg_type if msg_type in ["group", "private"] else "unknown", target_id)
+            stats_manager.log_message_detail(msg_type, target_id, message, msg_type)
+
+        return await original_call_api(api, **data)
+
+    bot.call_api = types.MethodType(wrapped_call_api, bot)
+    logger.success(f"[msg_counter] 成功 Hook Bot {bot.self_id} 的 call_api 方法")
+
+
+@driver.on_bot_connect
+async def handle_bot_connect(bot: OB11Bot):
+    if isinstance(bot, OB11Bot):
+        patch_call_api(bot)
+
+
+# === 指令：今日统计 ===
+cmd_stats = on_command("统计", aliases={"sc"}, permission=SUPERUSER, priority=5, block=True)
+cmd_stats_yesterday = on_command("昨日统计", aliases={"scy"}, permission=SUPERUSER, priority=5, block=True)
+
+
+@cmd_stats.handle()
+async def handle_stats_cmd():
+    file_path = get_today_dir() / "stats.log"
+
+    if not file_path.exists():
+        await cmd_stats.finish("📭 今天还没有任何消息发送记录。")
+
+    content = file_path.read_text(encoding="utf-8")
+    await cmd_stats.finish(f"📊 今日发送统计：\n\n{content}")
+
+@cmd_stats_yesterday.handle()
+async def handle_yesterday_stats_cmd():
+    file_path = get_yesterday_dir() / "stats.log"
+
+    if not file_path.exists():
+        await cmd_stats_yesterday.finish("📭 昨天还没有任何消息发送记录。")
+
+    content = file_path.read_text(encoding="utf-8")
+    await cmd_stats_yesterday.finish(f"📊 昨日发送统计：\n\n{content}")
+
+# === 指令：群组统计 ===
+cmd_group_stats = on_command("群组统计", aliases={"gsc"}, permission=SUPERUSER, priority=5, block=True)
+cmd_group_stats_yesterday = on_command("昨日群组统计", aliases={"gscy"}, permission=SUPERUSER, priority=5, block=True)
+
+
+@cmd_group_stats.handle()
+async def handle_group_stats_cmd(event: MessageEvent, args: Message = CommandArg()):
+    csv_path = get_today_dir() / "group_stats.csv"
+
+    if not csv_path.exists():
+        await cmd_group_stats.finish("📭 今天还没有任何群组消息统计。")
+
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    if len(lines) <= 1:
+        await cmd_group_stats.finish("📭 今天还没有任何群组消息记录。")
+
+    groups = [line.split(",") for line in lines[1:]]
+    groups.sort(key=lambda x: int(x[1]), reverse=True)
+
+    arg_text = args.extract_plain_text().strip()
+
+    if arg_text.lower() == "all" or not isinstance(event, GroupMessageEvent):
+        msg = "📚 群组发送统计：\n\n"
+        for gid, count in groups:
+            msg += f"群号 {gid}: {count} 条\n"
+        await cmd_group_stats.finish(msg.strip())
+
+    else:
+        # 优先解析参数中的群号
+        gid = int(arg_text) if arg_text.isdigit() else event.group_id
+        for g, count in groups:
+            if int(g) == gid:
+                await cmd_group_stats.finish(f"📊 群组 {gid} 今日发送统计：{count} 条")
+        await cmd_group_stats.finish(f"📭 群组 {gid} 今日没有发送记录。")
+
+
+@cmd_group_stats_yesterday.handle()
+async def handle_yesterday_group_stats_cmd(event: MessageEvent, args: Message = CommandArg()):
+    csv_path = get_yesterday_dir() / "group_stats.csv"
+
+    if not csv_path.exists():
+        await cmd_group_stats_yesterday.finish("📭 昨天还没有任何群组消息统计。")
+
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    if len(lines) <= 1:
+        await cmd_group_stats_yesterday.finish("📭 昨天还没有任何群组消息记录。")
+
+    groups = [line.split(",") for line in lines[1:]]
+    groups.sort(key=lambda x: int(x[1]), reverse=True)
+
+    arg_text = args.extract_plain_text().strip()
+
+    if arg_text.lower() == "all" or not isinstance(event, GroupMessageEvent):
+        msg = "📚 昨日群组发送统计：\n\n"
+        for gid, count in groups:
+            msg += f"群号 {gid}: {count} 条\n"
+        await cmd_group_stats_yesterday.finish(msg.strip())
+
+    else:
+        gid = int(arg_text) if arg_text.isdigit() else event.group_id
+        for g, count in groups:
+            if int(g) == gid:
+                await cmd_group_stats_yesterday.finish(f"📊 群组 {gid} 昨日发送统计：{count} 条")
+        await cmd_group_stats_yesterday.finish(f"📭 群组 {gid} 昨天没有发送记录。")
